@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Email Assistant</title>
+<script src="https://appsforoffice.microsoft.com/lib/1.1/hosted/office.js"></script>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
+    --accent: #2b6cb0; --accent-fg: #ffffff; --panel: #f7f7f8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1e1e1e; --fg:#f0f0f0; --muted:#aaa; --border:#3a3a3a; --panel:#2a2a2a; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px; background: var(--bg); color: var(--fg);
+    font-family: "Segoe UI", -apple-system, Arial, sans-serif; font-size: 13px;
+  }
+  h1 { font-size: 15px; margin: 0 0 4px; display:flex; align-items:center; gap:8px; }
+  .badge {
+    display:inline-block; font-size: 10px; padding: 2px 7px; border-radius: 10px;
+    background: var(--accent); color: var(--accent-fg); font-weight:600;
+  }
+  .sub { color: var(--muted); margin: 0 0 14px; font-size: 12px; }
+  label { display:block; margin: 10px 0 4px; font-weight:600; font-size:12px; }
+  input[type=text], input[type=password], select, textarea {
+    width: 100%; padding: 7px 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel); color: var(--fg); font-size: 13px; font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 70px; }
+  .row { display:flex; gap:8px; margin-top: 12px; }
+  button {
+    flex: 1; padding: 9px 10px; border: none; border-radius: 6px; cursor: pointer;
+    background: var(--accent); color: var(--accent-fg); font-weight:600; font-size: 13px;
+  }
+  button.secondary { background: var(--panel); color: var(--fg); border: 1px solid var(--border); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #output {
+    margin-top: 14px; white-space: pre-wrap; border: 1px solid var(--border);
+    background: var(--panel); border-radius: 6px; padding: 10px; min-height: 90px;
+    font-size: 13px; line-height: 1.4;
+  }
+  #status { margin-top: 8px; font-size: 12px; color: var(--muted); min-height: 16px; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .key-row { display:flex; gap:6px; align-items:center; }
+  .key-row input { flex: 1; }
+  .key-row button { flex: 0 0 auto; padding: 7px 10px; }
+</style>
+</head>
+<body>
+
+<h1>AI Email Assistant <span class="badge" id="providerBadge">...</span></h1>
+<p class="sub" id="providerSub">Loading provider configuration…</p>
+
+<label for="providerSelect">Provider</label>
+<select id="providerSelect"></select>
+
+<label for="modelInput">Model</label>
+<input type="text" id="modelInput" />
+<div class="hint" id="modelHint"></div>
+
+<label for="apiKeyInput">API key (stored only in this browser, per provider)</label>
+<div class="key-row">
+  <input type="password" id="apiKeyInput" placeholder="Paste your API key" />
+  <button class="secondary" id="toggleKeyBtn" type="button">Show</button>
+</div>
+<div class="hint" id="endpointHint"></div>
+
+<label for="instructionInput">Extra instructions (optional)</label>
+<textarea id="instructionInput" placeholder="e.g. keep it short, friendly tone, reply in Arabic..."></textarea>
+
+<div class="row">
+  <button id="summarizeBtn">Summarize email</button>
+  <button id="draftBtn">Draft reply</button>
+</div>
+
+<div id="status"></div>
+<div id="output">Output will appear here.</div>
+
+<div class="row">
+  <button class="secondary" id="insertBtn" disabled>Insert into reply body</button>
+  <button class="secondary" id="copyBtn" disabled>Copy</button>
+</div>
+
+<script>
+/* ---------------------------------------------------------------------
+   Provider configuration
+   Each provider defines how to build the request + parse the response.
+   Most non-OpenAI providers below actually expose OpenAI-compatible
+   /chat/completions endpoints, so they share the same request builder.
+--------------------------------------------------------------------- */
+
+const OPENAI_COMPAT = (base, extraHeaders) => ({
+  endpoint: base,
+  headers: (key) => ({
+    "Content-Type": "application/json",
+    "Authorization": "Bearer " + key,
+    ...(extraHeaders || {})
+  }),
+  body: (model, system, user) => JSON.stringify({
+    model,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    max_tokens: 1000
+  }),
+  parse: (data) => {
+    if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+    return data.choices?.[0]?.message?.content?.trim() || "(empty response)";
+  }
+});
+
+const PROVIDERS = {
+  openai: {
+    label: "OpenAI (GPT)",
+    defaultModel: "gpt-4o-mini",
+    modelHint: "e.g. gpt-4o-mini, gpt-4o, gpt-4.1, o4-mini",
+    endpointHint: "Key from platform.openai.com. Calls https://api.openai.com/v1/chat/completions",
+    ...OPENAI_COMPAT("https://api.openai.com/v1/chat/completions")
+  },
+  claude: {
+    label: "Claude (Anthropic)",
+    defaultModel: "claude-sonnet-4-5",
+    modelHint: "e.g. claude-sonnet-4-5, claude-opus-4-5, claude-haiku-4-5",
+    endpointHint: "Key from console.anthropic.com. Calls https://api.anthropic.com/v1/messages (browser calls need Anthropic's browser-access header, included automatically)",
+    endpoint: "https://api.anthropic.com/v1/messages",
+    headers: (key) => ({
+      "Content-Type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    }),
+    body: (model, system, user) => JSON.stringify({
+      model,
+      max_tokens: 1000,
+      system,
+      messages: [{ role: "user", content: user }]
+    }),
+    parse: (data) => {
+      if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+      return data.content?.map(b => b.text || "").join("").trim() || "(empty response)";
+    }
+  },
+  gemini: {
+    label: "Gemini (Google)",
+    defaultModel: "gemini-2.0-flash",
+    modelHint: "e.g. gemini-2.0-flash, gemini-1.5-pro",
+    endpointHint: "Key from aistudio.google.com. Calls https://generativelanguage.googleapis.com",
+    endpoint: (model, key) =>
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`,
+    headers: () => ({ "Content-Type": "application/json" }),
+    body: (model, system, user) => JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: [{ text: user }] }]
+    }),
+    parse: (data) => {
+      if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+      return data.candidates?.[0]?.content?.parts?.map(p => p.text).join("").trim() || "(empty response)";
+    }
+  },
+  qwen: {
+    label: "Qwen (Alibaba DashScope)",
+    defaultModel: "qwen-plus",
+    modelHint: "e.g. qwen-plus, qwen-turbo, qwen-max",
+    endpointHint: "Key from dashscope console. Calls DashScope's OpenAI-compatible endpoint",
+    ...OPENAI_COMPAT("https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions")
+  },
+  deepseek: {
+    label: "DeepSeek",
+    defaultModel: "deepseek-chat",
+    modelHint: "e.g. deepseek-chat, deepseek-reasoner",
+    endpointHint: "Key from platform.deepseek.com. Calls https://api.deepseek.com/chat/completions",
+    ...OPENAI_COMPAT("https://api.deepseek.com/chat/completions")
+  },
+  grok: {
+    label: "Grok (xAI)",
+    defaultModel: "grok-4",
+    modelHint: "e.g. grok-4, grok-4-fast",
+    endpointHint: "Key from console.x.ai. Calls https://api.x.ai/v1/chat/completions",
+    ...OPENAI_COMPAT("https://api.x.ai/v1/chat/completions")
+  },
+  mistral: {
+    label: "Mistral AI",
+    defaultModel: "mistral-large-latest",
+    modelHint: "e.g. mistral-large-latest, mistral-small-latest",
+    endpointHint: "Key from console.mistral.ai. Calls https://api.mistral.ai/v1/chat/completions",
+    ...OPENAI_COMPAT("https://api.mistral.ai/v1/chat/completions")
+  },
+  groq: {
+    label: "Groq (fast open models)",
+    defaultModel: "llama-3.3-70b-versatile",
+    modelHint: "e.g. llama-3.3-70b-versatile, mixtral-8x7b-32768",
+    endpointHint: "Key from console.groq.com. Calls https://api.groq.com/openai/v1/chat/completions",
+    ...OPENAI_COMPAT("https://api.groq.com/openai/v1/chat/completions")
+  },
+  together: {
+    label: "Together AI",
+    defaultModel: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    modelHint: "e.g. meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    endpointHint: "Key from api.together.ai. Calls https://api.together.xyz/v1/chat/completions",
+    ...OPENAI_COMPAT("https://api.together.xyz/v1/chat/completions")
+  },
+  perplexity: {
+    label: "Perplexity",
+    defaultModel: "sonar",
+    modelHint: "e.g. sonar, sonar-pro",
+    endpointHint: "Key from perplexity.ai/settings/api. Calls https://api.perplexity.ai/chat/completions",
+    ...OPENAI_COMPAT("https://api.perplexity.ai/chat/completions")
+  }
+};
+
+/* --------------------------- UI wiring --------------------------- */
+
+const qs = new URLSearchParams(location.search);
+const initialProvider = PROVIDERS[qs.get("provider")] ? qs.get("provider") : "openai";
+
+const providerSelect = document.getElementById("providerSelect");
+const modelInput = document.getElementById("modelInput");
+const modelHint = document.getElementById("modelHint");
+const apiKeyInput = document.getElementById("apiKeyInput");
+const endpointHint = document.getElementById("endpointHint");
+const instructionInput = document.getElementById("instructionInput");
+const statusEl = document.getElementById("status");
+const outputEl = document.getElementById("output");
+const providerBadge = document.getElementById("providerBadge");
+const providerSub = document.getElementById("providerSub");
+
+Object.keys(PROVIDERS).forEach(key => {
+  const opt = document.createElement("option");
+  opt.value = key;
+  opt.textContent = PROVIDERS[key].label;
+  providerSelect.appendChild(opt);
+});
+providerSelect.value = initialProvider;
+
+function loadProviderUI() {
+  const p = PROVIDERS[providerSelect.value];
+  providerBadge.textContent = providerSelect.value.toUpperCase();
+  providerSub.textContent = p.label + " — reads the current email and calls the model directly from this task pane.";
+  modelHint.textContent = p.modelHint;
+  endpointHint.textContent = p.endpointHint;
+  const savedModel = localStorage.getItem("aiEmailAssistant.model." + providerSelect.value);
+  modelInput.value = savedModel || p.defaultModel;
+  const savedKey = localStorage.getItem("aiEmailAssistant.key." + providerSelect.value);
+  apiKeyInput.value = savedKey || "";
+}
+providerSelect.addEventListener("change", loadProviderUI);
+loadProviderUI();
+
+modelInput.addEventListener("change", () => {
+  localStorage.setItem("aiEmailAssistant.model." + providerSelect.value, modelInput.value.trim());
+});
+apiKeyInput.addEventListener("change", () => {
+  localStorage.setItem("aiEmailAssistant.key." + providerSelect.value, apiKeyInput.value.trim());
+});
+
+document.getElementById("toggleKeyBtn").addEventListener("click", () => {
+  const btn = document.getElementById("toggleKeyBtn");
+  if (apiKeyInput.type === "password") { apiKeyInput.type = "text"; btn.textContent = "Hide"; }
+  else { apiKeyInput.type = "password"; btn.textContent = "Show"; }
+});
+
+document.getElementById("copyBtn").addEventListener("click", () => {
+  navigator.clipboard.writeText(outputEl.textContent).catch(() => {});
+});
+
+let lastResult = "";
+
+/* --------------------------- Office.js helpers --------------------------- */
+
+function getEmailBody() {
+  return new Promise((resolve, reject) => {
+    if (typeof Office === "undefined" || !Office.context || !Office.context.mailbox || !Office.context.mailbox.item) {
+      resolve("(No email context available — running outside Outlook, or item not loaded yet.)");
+      return;
+    }
+    Office.context.mailbox.item.body.getAsync(Office.CoercionType.Text, (result) => {
+      if (result.status === Office.AsyncResultStatus.Succeeded) resolve(result.value);
+      else reject(new Error(result.error ? result.error.message : "Could not read email body"));
+    });
+  });
+}
+
+function insertIntoBody(text) {
+  return new Promise((resolve, reject) => {
+    const item = Office.context.mailbox.item;
+    if (!item || !item.body || !item.body.setSelectedDataAsync) {
+      reject(new Error("Insert is only available in compose/reply windows."));
+      return;
+    }
+    item.body.setSelectedDataAsync(text, { coercionType: Office.CoercionType.Text }, (result) => {
+      if (result.status === Office.AsyncResultStatus.Succeeded) resolve();
+      else reject(new Error(result.error ? result.error.message : "Could not insert text"));
+    });
+  });
+}
+
+/* --------------------------- Core call logic --------------------------- */
+
+async function callProvider(providerKey, apiKey, model, systemPrompt, userPrompt) {
+  const p = PROVIDERS[providerKey];
+  const endpoint = typeof p.endpoint === "function" ? p.endpoint(model, apiKey) : p.endpoint;
+  const headers = p.headers(apiKey);
+  const body = p.body(model, systemPrompt, userPrompt);
+
+  const res = await fetch(endpoint, { method: "POST", headers, body });
+  let data;
+  try { data = await res.json(); }
+  catch { throw new Error("Non-JSON response (HTTP " + res.status + "). The provider may be blocking direct browser calls (CORS) — see note in README."); }
+  if (!res.ok && !data.error) throw new Error("HTTP " + res.status + ": " + JSON.stringify(data).slice(0, 300));
+  return p.parse(data);
+}
+
+async function run(task) {
+  const providerKey = providerSelect.value;
+  const apiKey = apiKeyInput.value.trim();
+  const model = modelInput.value.trim();
+  const extra = instructionInput.value.trim();
+
+  if (!apiKey) { statusEl.textContent = "Enter your API key first."; return; }
+
+  document.getElementById("summarizeBtn").disabled = true;
+  document.getElementById("draftBtn").disabled = true;
+  document.getElementById("insertBtn").disabled = true;
+  document.getElementById("copyBtn").disabled = true;
+  statusEl.textContent = "Reading email…";
+  outputEl.textContent = "";
+
+  try {
+    const emailText = await getEmailBody();
+    statusEl.textContent = "Calling " + PROVIDERS[providerKey].label + "…";
+
+    let system, user;
+    if (task === "summarize") {
+      system = "You summarize emails concisely for a busy professional. Return 3-6 short bullet points covering key asks, deadlines, and decisions needed. No preamble.";
+      user = (extra ? "Extra instructions: " + extra + "\n\n" : "") + "Email:\n" + emailText;
+    } else {
+      system = "You draft clear, professional email replies. Match the tone of the original email unless told otherwise. Return only the reply body text, no subject line, no explanation.";
+      user = (extra ? "Extra instructions: " + extra + "\n\n" : "") + "Original email to reply to:\n" + emailText;
+    }
+
+    const result = await callProvider(providerKey, apiKey, model, system, user);
+    lastResult = result;
+    outputEl.textContent = result;
+    statusEl.textContent = "Done.";
+    document.getElementById("insertBtn").disabled = false;
+    document.getElementById("copyBtn").disabled = false;
+  } catch (err) {
+    statusEl.textContent = "Error.";
+    outputEl.textContent = String(err.message || err);
+  } finally {
+    document.getElementById("summarizeBtn").disabled = false;
+    document.getElementById("draftBtn").disabled = false;
+  }
+}
+
+document.getElementById("summarizeBtn").addEventListener("click", () => run("summarize"));
+document.getElementById("draftBtn").addEventListener("click", () => run("draft"));
+document.getElementById("insertBtn").addEventListener("click", async () => {
+  try { await insertIntoBody(lastResult); statusEl.textContent = "Inserted into reply."; }
+  catch (err) { statusEl.textContent = String(err.message || err); }
+});
+
+Office.onReady(() => {
+  statusEl.textContent = "Ready.";
+});
+</script>
+</body>
+</html>
